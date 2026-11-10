@@ -15,6 +15,7 @@
 import {describe, it, afterEach, beforeEach} from 'mocha';
 import * as sinon from 'sinon';
 import {GitHub} from '../../../src/github';
+import {FileNotFoundError} from '../../../src/errors';
 import {Manifest} from '../../../src/manifest';
 import {Update} from '../../../src/update';
 import {
@@ -63,6 +64,94 @@ describe('Plugin compatibility', () => {
     sandbox.restore();
   });
   describe('separate-pull-requests and workspace plugin', () => {
+    // Unlabelled forced releases can merge without a tag, and a shared manifest
+    // can claim a dependent version before that dependent's PR has merged.
+    for (const [description, labels] of [
+      ['default labels', undefined],
+      ['configured labels', ['release: waiting', 'release: validated']],
+    ] as const) {
+      it(`preserves candidate labels and manifest ownership with ${description}`, async () => {
+        const paths = ['node1', 'node2', 'node3', 'node4'];
+        const names = ['pkgA', 'pkgB', 'pkgC', 'pkgD'];
+        const base = Object.fromEntries(paths.map(path => [`packages/${path}`, '1.0.0']));
+        mockReleases(sandbox, github, names.map((name, index) => ({
+          id: index + 1, sha: 'abc123', tagName: `${name}-v1.0.0`,
+          url: `https://github.com/fake-owner/fake-repo/releases/tag/${name}-v1.0.0`,
+        })));
+        mockCommits(sandbox, github, [{
+          sha: 'aaaaaa', message: 'feat: some feature', files: ['packages/node3/foo'],
+        }]);
+        const inlineFiles: [string, string][] = [
+          ['package.json', JSON.stringify({name: 'root', private: true, workspaces: ['packages/*']})],
+          ['.release-please-manifest.json', JSON.stringify(base)],
+        ];
+        for (let i = 0; i < paths.length; i++) {
+          inlineFiles.push([
+            `packages/${paths[i]}/package.json`,
+            JSON.stringify({
+              name: names[i], version: '1.0.0',
+              ...(i < 2 ? {dependencies: {pkgC: 'workspace:*'}} : {}),
+            }),
+          ]);
+          inlineFiles.push([`packages/${paths[i]}/CHANGELOG.md`, '# Changelog\n']);
+        }
+        stubFilesFromFixtures({
+          sandbox, github, fixturePath: fixturesPath, files: [], inlineFiles,
+          flatten: false, targetBranch: 'main',
+        });
+        (github.getFileContentsOnBranch as sinon.SinonStub).rejects(new FileNotFoundError('missing'));
+        const findFiles = sandbox.stub(github, 'findFilesByGlobAndRef');
+        for (const path of paths) {
+          findFiles.withArgs(`packages/${path}`, 'main').resolves([`packages/${path}`]);
+        }
+        const manifest = new Manifest(
+          github, 'main',
+          Object.fromEntries(paths.map((path, i) => [
+            `packages/${path}`, {releaseType: 'node', component: names[i]},
+          ])),
+          Object.fromEntries(paths.map(path => [`packages/${path}`, Version.parse('1.0.0')])),
+          {
+            plugins: [{type: 'node-workspace'}], separatePullRequests: true,
+            ...(labels ? {labels: [...labels]} : {}),
+          }
+        );
+        const candidates = await manifest.buildPullRequests();
+        const byPath = new Map(candidates.map(candidate => {
+          const path = paths.find(item =>
+            candidate.updates.some(update => update.path === `packages/${item}/CHANGELOG.md`)
+          );
+          return [path, candidate];
+        }));
+        expect([...byPath.keys()].sort()).to.eql(['node1', 'node2', 'node3']);
+        const actual = [];
+        const expected = [];
+        for (const path of ['node1', 'node2', 'node3']) {
+          const candidate = byPath.get(path)!;
+          const version = path === 'node3' ? '1.1.0' : '1.0.1';
+          const changes = await github.buildChangeSet(candidate.updates, 'main');
+          const manifestChange = changes.get('.release-please-manifest.json');
+          const changedManifest = manifestChange ? JSON.parse(manifestChange.content!) : base;
+          const versions = Object.fromEntries(paths.map(item => {
+            const original = JSON.parse(inlineFiles.find(([file]) =>
+              file === `packages/${item}/package.json`
+            )![1]);
+            const change = changes.get(`packages/${item}/package.json`);
+            return [item, change ? JSON.parse(change.content!).version : original.version];
+          }));
+          actual.push({
+            path, labels: [...candidate.labels].sort(), manifest: changedManifest, versions,
+            dependencyNote: path === 'node3' || candidate.body.toString().includes('pkgC bumped to 1.1.0'),
+          });
+          expected.push({
+            path, labels: [...(labels ?? ['autorelease: pending'])].sort(),
+            manifest: {...base, [`packages/${path}`]: version},
+            versions: Object.fromEntries(paths.map(item => [item, item === path ? version : '1.0.0'])),
+            dependencyNote: true,
+          });
+        }
+        expect(actual).to.eql(expected);
+      });
+    }
     it('should version bump dependencies together', async () => {
       // Scenario:
       //   - package a,b depends on c
